@@ -6,7 +6,7 @@ import sys
 from functools import reduce
 from itertools import chain
 
-from numpy import asarray, allclose
+from numpy import asarray, allclose, isnan
 
 import ufl
 from ufl.algorithms import extract_arguments, extract_coefficients
@@ -24,6 +24,7 @@ from FIAT.functional import PointEvaluation
 
 from finat.point_set import PointSet
 from finat.quadrature import AbstractQuadratureRule, make_quadrature, QuadratureRule
+from finat.quadrature_element import QuadratureElement
 
 from tsfc import fem, ufl_utils
 from tsfc.finatinterface import as_fiat_cell
@@ -286,7 +287,8 @@ def compile_expression_dual_evaluation(expression, to_element, *,
 
     # Just convert FInAT element to FIAT for now.
     # Dual evaluation in FInAT will bring a thorough revision.
-    to_element = to_element.fiat_equivalent
+    finat_to_element = to_element
+    to_element = finat_to_element.fiat_equivalent
 
     if any(len(dual.deriv_dict) != 0 for dual in to_element.dual_basis()):
         raise NotImplementedError("Can only interpolate onto dual basis functionals without derivative evaluation, sorry!")
@@ -357,7 +359,21 @@ def compile_expression_dual_evaluation(expression, to_element, *,
                       index_cache={},
                       scalar_type=parameters["scalar_type"])
 
-    if all(isinstance(dual, PointEvaluation) for dual in to_element.dual_basis()):
+    from finat.tensorfiniteelement import TensorFiniteElement
+    runtime_point_interpolation = (
+        isinstance(finat_to_element, QuadratureElement) or
+        (
+            isinstance(finat_to_element, TensorFiniteElement) and
+            isinstance(finat_to_element.base_element, QuadratureElement)
+        ) and
+        isinstance(finat_to_element._rule.point_set.expression, gem.Variable)
+    )
+
+    point_evaluation_nodes_only = (
+        all(isinstance(dual, PointEvaluation) for dual in to_element.dual_basis()) and not
+        runtime_point_interpolation
+    )
+    if point_evaluation_nodes_only:
         # This is an optimisation for point-evaluation nodes which
         # should go away once FInAT offers the interface properly
         qpoints = []
@@ -398,9 +414,18 @@ def compile_expression_dual_evaluation(expression, to_element, *,
             try:
                 expr, point_set = expr_cache[pts]
             except KeyError:
-                point_set = PointSet(pts)
+                if runtime_point_interpolation:
+                    assert isnan(pts).all()
+                    point_set = finat_to_element._rule.point_set
+                else:
+                    point_set = PointSet(pts)
                 config = kernel_cfg.copy()
-                config.update(point_set=point_set)
+                if isinstance(point_set.expression, gem.Variable):
+                    # config for fem.GemPointContext
+                    config.update(point_indices=point_set.indices, point_expr=point_set.expression)
+                else:
+                    # config for fem.PointSetContext
+                    config.update(point_set=point_set)
                 expr, = fem.compile_ufl(expression, **config, point_sum=False)
                 # In some cases point_set.indices may be dropped from expr, but
                 # nothing new should now appear
@@ -413,7 +438,11 @@ def compile_expression_dual_evaluation(expression, to_element, *,
                     weights[cmp].append(w)
             qexprs = gem.Zero()
             for cmp in sorted(weights):
-                qweights = gem.Literal(weights[cmp])
+                if runtime_point_interpolation:
+                    # Only have 1 point so make sure Literal has correct shape
+                    qweights = gem.Literal(weights[cmp][0])
+                else:
+                    qweights = gem.Literal(weights[cmp])
                 qexpr = gem.Indexed(expr, cmp)
                 qexpr = gem.index_sum(gem.Indexed(qweights, point_set.indices)*qexpr,
                                       point_set.indices)
@@ -433,6 +462,15 @@ def compile_expression_dual_evaluation(expression, to_element, *,
     else:
         return_arg = lp.GlobalArg("A", dtype=parameters["scalar_type"], shape=return_shape)
 
+    # register runtime tabulation kernel argument
+    other_args = []
+    if runtime_point_interpolation:
+        ps_expr = finat_to_element._rule.point_set.expression
+        if coffee:
+            other_args.append(ast.Decl(parameters["scalar_type"], ast.Symbol('X', rank=(ps_expr.shape,))))
+        else:
+            other_args.append(lp.GlobalArg(ps_expr.name, dtype=parameters["scalar_type"], shape=ps_expr.shape))
+
     return_expr = gem.Indexed(return_var, return_indices)
 
     # TODO: one should apply some GEM optimisations as in assembly,
@@ -443,7 +481,7 @@ def compile_expression_dual_evaluation(expression, to_element, *,
     # Handle kernel interface requirements
     builder.register_requirements([ir])
     # Build kernel tuple
-    return builder.construct_kernel(return_arg, impero_c, index_names, first_coefficient_fake_coords)
+    return builder.construct_kernel(return_arg, impero_c, index_names, first_coefficient_fake_coords, other_args=other_args)
 
 
 def lower_integral_type(fiat_cell, integral_type):
